@@ -506,11 +506,7 @@ local function taskRow(task, listInfo, today: number, showListName: boolean)
   if task.important then
     table.insert(trailing, ui.glyph({ name = "flag", size = 13, color = "error" }))
   end
-  if readOnly then
-    if hovered then
-      table.insert(trailing, ui.glyph({ name = "lock", size = 13, color = "on_surface_variant" }))
-    end
-  elseif confirming then
+  if confirming and not readOnly then
     table.insert(trailing, ui.label({ text = tr("confirm_delete"), fontSize = 11, color = "error" }))
     table.insert(trailing, iconButton("del-yes-" .. task.uid, "check", tr("delete"), function()
       deleteTask(task)
@@ -519,11 +515,20 @@ local function taskRow(task, listInfo, today: number, showListName: boolean)
       pendingDelete = nil
       render()
     end, nil, rowHover(task.uid)))
-  elseif hovered then
-    table.insert(trailing, iconButton("del-" .. task.uid, "trash", tr("delete"), function()
-      pendingDelete = task.uid
-      render()
-    end, nil, rowHover(task.uid)))
+  else
+    -- Always laid out and only faded in on hover: inserting it reflowed the row.
+    local action = readOnly
+      and ui.glyph({ name = "lock", size = 13, color = "on_surface_variant" })
+      or iconButton("del-" .. task.uid, "trash", tr("delete"), function()
+        pendingDelete = task.uid
+        render()
+      end, nil, rowHover(task.uid))
+    table.insert(trailing, ui.row({
+      key = "action-" .. task.uid,
+      align = "center",
+      justify = "center",
+      opacity = hovered and 1.0 or 0.0,
+    }, { action }))
   end
 
   local children = {
