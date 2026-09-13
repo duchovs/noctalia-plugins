@@ -14,6 +14,8 @@ local store = require("./lib/store.luau")
 
 local IDLE_TICK_MS = 60 * 1000
 local LOGIN_TICK_MS = 1000 -- while a browser login is pending
+local JOB_TICK_MS = 16 -- while a sync is in flight; the host's minimum
+local JOB_TICK_BUDGET_MS = 10 -- of the 25 ms of CPU the host allows each update()
 local LOGIN_POLL_SECONDS = 2
 local LOGIN_LIFETIME_SECONDS = 20 * 60 -- the server's own token lifetime
 
@@ -34,6 +36,7 @@ local intervalMinutes = 5
 local nextSyncAt = 0
 local login = nil -- { flow, deadline } while a browser login is pending
 local loginPollAt = 0
+local jobs = {} -- deferred slices of sync work, oldest first
 
 local function publishStatus()
   noctalia.state.set(store.STATUS, {
@@ -255,11 +258,37 @@ local function publishLogin(phase: string, message: string?, url: string?)
   })
 end
 
--- Ticking every second costs nothing while a login is pending and keeps the
--- idle case at one wakeup a minute.
+-- Fast ticks cost nothing while a sync or login is in flight and keep the idle
+-- case at one wakeup a minute.
 local function applyInterval()
-  noctalia.setUpdateInterval(login ~= nil and LOGIN_TICK_MS or IDLE_TICK_MS)
+  local interval = IDLE_TICK_MS
+  if syncing or #jobs > 0 then
+    interval = JOB_TICK_MS
+  elseif login ~= nil then
+    interval = LOGIN_TICK_MS
+  end
+  noctalia.setUpdateInterval(interval)
 end
+
+-- Sliced sync work from lib/caldav.luau runs here, a few slices per update tick,
+-- so each gets a fresh CPU budget instead of sharing one HTTP callback's.
+local function defer(fn)
+  table.insert(jobs, fn)
+  applyInterval()
+end
+
+local function runJobs()
+  if #jobs == 0 then
+    return
+  end
+  local tickEnd = noctalia.nowMs() + JOB_TICK_BUDGET_MS
+  repeat
+    local job = table.remove(jobs, 1)
+    job()
+  until #jobs == 0 or noctalia.nowMs() >= tickEnd
+end
+
+caldav.setScheduler(defer)
 
 local function startLogin(url: string)
   if login ~= nil then
@@ -317,14 +346,15 @@ local function pollLogin()
 end
 
 -- Scheduling is by wall clock rather than a tick count, because the tick rate
--- changes while a login is pending.
+-- changes while a sync or login is in flight.
 readInterval()
-applyInterval()
 publishLogin("idle")
 publishStatus()
 sync()
+applyInterval()
 
 function update()
+  runJobs()
   if login ~= nil then
     pollLogin()
   end
@@ -332,6 +362,7 @@ function update()
   if not syncing and os.time() >= nextSyncAt then
     sync()
   end
+  applyInterval()
 end
 
 function onConfigChanged()

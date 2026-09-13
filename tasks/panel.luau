@@ -360,7 +360,7 @@ end
 
 -- ── Building blocks ──────────────────────────────────────────────────────────
 
-local function iconButton(key: string, glyph: string, tooltip: string, onClick, variant: string?)
+local function iconButton(key: string, glyph: string, tooltip: string, onClick, variant: string?, onHover)
   return ui.button({
     key = key,
     glyph = glyph,
@@ -368,6 +368,7 @@ local function iconButton(key: string, glyph: string, tooltip: string, onClick, 
     controlSize = "sm",
     tooltip = tooltip,
     onClick = onClick,
+    onHover = onHover,
   })
 end
 
@@ -382,6 +383,14 @@ local function sectionHeader(label: string, count: number)
     ui.label({ text = tostring(count), fontSize = 10, color = "on_surface_variant" }),
     ui.separator({ flexGrow = 1, color = "outline" }),
   })
+end
+
+-- The host hovers only the innermost input area under the pointer, so a row's
+-- checkbox and buttons forward their hover to the row or it un-highlights there.
+local function rowHover(uid: string)
+  return function(state)
+    onRowHover(state, uid)
+  end
 end
 
 -- A checkbox that reads as one: an outlined square in the list's colour that
@@ -401,6 +410,7 @@ local function checkbox(task, color: string, readOnly: boolean?)
     border = checked and color or "outline",
     borderWidth = checked and 0 or 2,
     opacity = (pending or readOnly) and 0.5 or 1.0,
+    onHover = rowHover(task.uid),
     -- A collection the server grants no write privilege on gets no control at
     -- all, rather than one that fails on click.
     onClick = not readOnly and function()
@@ -504,16 +514,16 @@ local function taskRow(task, listInfo, today: number, showListName: boolean)
     table.insert(trailing, ui.label({ text = tr("confirm_delete"), fontSize = 11, color = "error" }))
     table.insert(trailing, iconButton("del-yes-" .. task.uid, "check", tr("delete"), function()
       deleteTask(task)
-    end, "destructive"))
+    end, "destructive", rowHover(task.uid)))
     table.insert(trailing, iconButton("del-no-" .. task.uid, "close", tr("cancel"), function()
       pendingDelete = nil
       render()
-    end))
+    end, nil, rowHover(task.uid)))
   elseif hovered then
     table.insert(trailing, iconButton("del-" .. task.uid, "trash", tr("delete"), function()
       pendingDelete = task.uid
       render()
-    end))
+    end, nil, rowHover(task.uid)))
   end
 
   local children = {
@@ -521,22 +531,13 @@ local function taskRow(task, listInfo, today: number, showListName: boolean)
     -- all-lists view, where rows from different lists sit next to each other.
     ui.box({ width = 3, height = 26, radius = 2 * cornerScale, fill = color }),
     checkbox(task, color, readOnly),
-    ui.column({
-      gap = 3,
-      flexGrow = 1,
-      onClick = function()
-        detailUid = task.uid
-        editorRev += 1
-        view = "detail"
-        pendingDelete = nil
-        render()
-      end,
-    }, title),
+    ui.column({ gap = 3, flexGrow = 1 }, title),
   }
   for _, node in ipairs(trailing) do
     table.insert(children, node)
   end
 
+  -- The row is the click target so the title adds no input area of its own.
   return ui.row({
     key = task.uid,
     gap = 10,
@@ -546,6 +547,13 @@ local function taskRow(task, listInfo, today: number, showListName: boolean)
     radius = 8 * cornerScale,
     fill = hovered and "hover" or "surface_variant",
     onHover = "onRowHover",
+    onClick = function()
+      detailUid = task.uid
+      editorRev += 1
+      view = "detail"
+      pendingDelete = nil
+      render()
+    end,
   }, children)
 end
 
@@ -1171,7 +1179,13 @@ end
 -- ── Callbacks ────────────────────────────────────────────────────────────────
 
 function onRowHover(state, key)
-  hoveredKey = (state == "true") and key or nil
+  if state == "true" then
+    hoveredKey = key
+  elseif hoveredKey == key then
+    hoveredKey = nil
+  else
+    return -- a leave from an area that no longer owns the hover
+  end
   render()
 end
 

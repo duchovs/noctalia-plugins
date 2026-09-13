@@ -120,15 +120,79 @@ local function propsOf(responseNode)
   return props
 end
 
+local function responsesOf(root)
+  if root.name ~= "multistatus" then
+    return nil, "expected a DAV multistatus, got <" .. root.name .. ">"
+  end
+  return xml.children(root, DAV, "response")
+end
+
 local function multistatus(body: string)
   local root, err = xml.parse(body)
   if root == nil then
     return nil, err
   end
-  if root.name ~= "multistatus" then
-    return nil, "expected a DAV multistatus, got <" .. root.name .. ">"
+  return responsesOf(root)
+end
+
+-- ── Sliced work ──────────────────────────────────────────────────────────────
+--
+-- The host gives each plugin callback 25 ms of CPU and meters it on every loop
+-- iteration, which makes parsing far costlier than it looks: one list of a few
+-- dozen tasks takes over 30 ms on a low-power laptop when done in one go. The
+-- service installs a scheduler that runs a deferred function on a later update
+-- tick with a fresh budget, and collection-sized responses are worked through
+-- in slices of it. Without a scheduler -- the panel and launcher, which only
+-- ever parse a single resource -- the work runs inline.
+
+local SLICE_MS = 5
+local defer = nil
+
+function M.setScheduler(scheduler)
+  defer = scheduler
+end
+
+-- Calls `work(shouldYield)` until it returns true, then `onDone()`. The first
+-- slice runs immediately; each later one is handed to the scheduler.
+local function sliced(work, onDone)
+  if defer == nil then
+    work(nil)
+    return onDone()
   end
-  return xml.children(root, DAV, "response")
+  local function run()
+    local sliceEnd = noctalia.nowMs() + SLICE_MS
+    local finished = work(function()
+      return noctalia.nowMs() >= sliceEnd
+    end)
+    if finished then
+      return onDone()
+    end
+    defer(run)
+  end
+  run()
+end
+
+-- multistatus() for a response that can be large: `onDone(responses, err)`.
+local function multistatusSliced(body: string, onDone)
+  local parser = xml.parser(body)
+  local root, err = nil, nil
+  sliced(function(shouldYield)
+    local done, result = parser.step(shouldYield)
+    if done == false then
+      return false
+    end
+    if done then
+      root = result
+    else
+      err = result
+    end
+    return true
+  end, function()
+    if root == nil then
+      return onDone(nil, err)
+    end
+    onDone(responsesOf(root))
+  end)
 end
 
 -- ── Discovery ────────────────────────────────────────────────────────────────
@@ -210,68 +274,69 @@ function M.discoverLists(account, onDone)
         if not listOk or listStatus ~= 207 then
           return onDone(nil, "collection listing returned HTTP " .. tostring(listStatus))
         end
-        local listResponses, listErr = multistatus(listBody)
-        if listResponses == nil then
-          return onDone(nil, listErr)
-        end
-
-        local lists = {}
-        for _, response in ipairs(listResponses) do
-          local props = propsOf(response)
-          local components = props[CALDAV .. "|supported-calendar-component-set"]
-          local holdsTodos = false
-          if components ~= nil then
-            for _, comp in ipairs(xml.children(components, CALDAV, "comp")) do
-              if (comp.attrs.name or ""):upper() == "VTODO" then
-                holdsTodos = true
-              end
-            end
+        multistatusSliced(listBody, function(listResponses, listErr)
+          if listResponses == nil then
+            return onDone(nil, listErr)
           end
 
-          -- Advertising VTODO is not enough to make something a task list.
-          -- A Depth:1 listing of the calendar home also returns the home
-          -- itself, CalDAV's scheduling collections, the trash bin, and any
-          -- subscribed ICS feed -- several of which claim VTODO support while
-          -- answering 403 or 404 to an actual query. RFC 4791 says a calendar
-          -- collection is the one carrying `<C:calendar/>` in its resourcetype,
-          -- so that -- not the component set -- is what decides.
-          local resourceType = props[DAV .. "|resourcetype"]
-          local isCalendar = resourceType ~= nil
-            and xml.child(resourceType, CALDAV, "calendar") ~= nil
-
-          if holdsTodos and isCalendar then
-            local href = M.resolveUrl(home, xml.text(xml.child(response, DAV, "href")))
-            local displayName = xml.text(props[DAV .. "|displayname"])
-            local color = xml.text(props[APPLE_ICAL .. "|calendar-color"])
-            local privileges = props[DAV .. "|current-user-privilege-set"]
-            local writable = true
-            if privileges ~= nil then
-              writable = false
-              for _, privilege in ipairs(xml.children(privileges, DAV, "privilege")) do
-                if xml.child(privilege, DAV, "write") ~= nil
-                  or xml.child(privilege, DAV, "write-content") ~= nil
-                  or xml.child(privilege, DAV, "all") ~= nil then
-                  writable = true
+          local lists = {}
+          for _, response in ipairs(listResponses) do
+            local props = propsOf(response)
+            local components = props[CALDAV .. "|supported-calendar-component-set"]
+            local holdsTodos = false
+            if components ~= nil then
+              for _, comp in ipairs(xml.children(components, CALDAV, "comp")) do
+                if (comp.attrs.name or ""):upper() == "VTODO" then
+                  holdsTodos = true
                 end
               end
             end
-            table.insert(lists, {
-              id = account.id .. "|" .. href,
-              accountId = account.id,
-              accountKind = account.kind,
-              href = href,
-              name = displayName ~= "" and displayName or (href:match("([^/]+)/?$") or href),
-              -- Servers write #rrggbb and #rrggbbaa; both are valid UiColor values.
-              color = color:match("^#%x+$") and color or nil,
-              ctag = xml.text(props[CALSRV .. "|getctag"]),
-              readOnly = not writable,
-            })
+
+            -- Advertising VTODO is not enough to make something a task list.
+            -- A Depth:1 listing of the calendar home also returns the home
+            -- itself, CalDAV's scheduling collections, the trash bin, and any
+            -- subscribed ICS feed -- several of which claim VTODO support while
+            -- answering 403 or 404 to an actual query. RFC 4791 says a calendar
+            -- collection is the one carrying `<C:calendar/>` in its resourcetype,
+            -- so that -- not the component set -- is what decides.
+            local resourceType = props[DAV .. "|resourcetype"]
+            local isCalendar = resourceType ~= nil
+              and xml.child(resourceType, CALDAV, "calendar") ~= nil
+
+            if holdsTodos and isCalendar then
+              local href = M.resolveUrl(home, xml.text(xml.child(response, DAV, "href")))
+              local displayName = xml.text(props[DAV .. "|displayname"])
+              local color = xml.text(props[APPLE_ICAL .. "|calendar-color"])
+              local privileges = props[DAV .. "|current-user-privilege-set"]
+              local writable = true
+              if privileges ~= nil then
+                writable = false
+                for _, privilege in ipairs(xml.children(privileges, DAV, "privilege")) do
+                  if xml.child(privilege, DAV, "write") ~= nil
+                    or xml.child(privilege, DAV, "write-content") ~= nil
+                    or xml.child(privilege, DAV, "all") ~= nil then
+                    writable = true
+                  end
+                end
+              end
+              table.insert(lists, {
+                id = account.id .. "|" .. href,
+                accountId = account.id,
+                accountKind = account.kind,
+                href = href,
+                name = displayName ~= "" and displayName or (href:match("([^/]+)/?$") or href),
+                -- Servers write #rrggbb and #rrggbbaa; both are valid UiColor values.
+                color = color:match("^#%x+$") and color or nil,
+                ctag = xml.text(props[CALSRV .. "|getctag"]),
+                readOnly = not writable,
+              })
+            end
           end
-        end
-        table.sort(lists, function(a, b)
-          return a.name:lower() < b.name:lower()
+          table.sort(lists, function(a, b)
+            return a.name:lower() < b.name:lower()
+          end)
+          onDone(lists, nil)
         end)
-        onDone(lists, nil)
       end)
     end)
   end)
@@ -320,31 +385,42 @@ function M.fetchTasks(account, list, onDone)
     if status ~= 207 then
       return onDone(nil, "task query returned HTTP " .. tostring(status))
     end
-    local responses, err = multistatus(body)
-    if responses == nil then
-      return onDone(nil, err)
-    end
-
-    local tasks = {}
-    for _, response in ipairs(responses) do
-      local props = propsOf(response)
-      local data = props[CALDAV .. "|calendar-data"]
-      local ics = xml.text(data)
-      if data ~= nil and ics ~= "" then
-        local calendar = ical.parse(ics)
-        local task = calendar ~= nil and ical.readTodo(calendar) or nil
-        if task ~= nil and task.uid ~= "" then
-          task.href = M.resolveUrl(list.href, xml.text(xml.child(response, DAV, "href")))
-          task.etag = xml.text(props[DAV .. "|getetag"])
-          task.listId = list.id
-          -- The source ICS travels with the task so an edit can rewrite it
-          -- without a refetch, and so nothing the plugin does not model is lost.
-          task.ics = ics
-          table.insert(tasks, task)
-        end
+    multistatusSliced(body, function(responses, err)
+      if responses == nil then
+        return onDone(nil, err)
       end
-    end
-    onDone(tasks, nil)
+
+      local tasks = {}
+      local index = 0
+      sliced(function(shouldYield)
+        while index < #responses do
+          index += 1
+          local response = responses[index]
+          local props = propsOf(response)
+          local data = props[CALDAV .. "|calendar-data"]
+          local ics = xml.text(data)
+          if data ~= nil and ics ~= "" then
+            local calendar = ical.parse(ics)
+            local task = calendar ~= nil and ical.readTodo(calendar) or nil
+            if task ~= nil and task.uid ~= "" then
+              task.href = M.resolveUrl(list.href, xml.text(xml.child(response, DAV, "href")))
+              task.etag = xml.text(props[DAV .. "|getetag"])
+              task.listId = list.id
+              -- The source ICS travels with the task so an edit can rewrite it
+              -- without a refetch, and so nothing the plugin does not model is lost.
+              task.ics = ics
+              table.insert(tasks, task)
+            end
+          end
+          if shouldYield ~= nil and shouldYield() then
+            return index >= #responses
+          end
+        end
+        return true
+      end, function()
+        onDone(tasks, nil)
+      end)
+    end)
   end)
 end
 

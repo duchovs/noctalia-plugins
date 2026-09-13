@@ -123,3 +123,10 @@ The bar widget's right click syncs.
   Subscribed calendars (`<cs:subscribed/>`, such as an ICS feed pulled from a
   URL) are excluded for the same reason — they are read-only event feeds, not
   task lists.
+- **CPU budget.** Noctalia gives every plugin callback 25 ms of CPU and meters
+  it on each loop iteration, which makes parsing much costlier than it looks: a
+  list of a few dozen tasks exceeded the budget on a low-power laptop when
+  parsed in one go, killing the sync before it could save anything. The `sync`
+  service therefore works through collection responses in ~5 ms slices, one
+  per update tick, ticking every 16 ms while a sync is in flight and once a
+  minute otherwise.

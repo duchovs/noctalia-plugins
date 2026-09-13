@@ -99,11 +99,21 @@ local function scopeFor(parentScope, attrs)
   return scope or parentScope
 end
 
--- Returns the root node, or (nil, err). Anything the parser does not need --
--- processing instructions, comments, doctypes -- is skipped rather than modelled.
-function M.parse(source: string)
+-- Markup items consumed between calls to `shouldYield`, which is a host call.
+local YIELD_CHECK_ITEMS = 32
+
+-- A resumable parser. `step(shouldYield)` returns (true, root) once the document
+-- is parsed, (nil, err) on malformed input, or false when `shouldYield()` asked
+-- it to stop -- calling `step` again resumes where it left off. The host meters
+-- every loop iteration against a 25 ms per-callback CPU budget, and a whole
+-- collection's WebDAV response does not fit inside one on a slow machine.
+--
+-- Anything the parser does not need -- processing instructions, comments,
+-- doctypes -- is skipped rather than modelled.
+function M.parser(source: string)
+  local failed = nil
   if type(source) ~= "string" or source == "" then
-    return nil, "empty document"
+    failed = "empty document"
   end
 
   local root = nil
@@ -111,24 +121,23 @@ function M.parse(source: string)
   local rootScope = setmetatable({}, { __index = function() return nil end })
   local scopes = { rootScope }
   local pos = 1
-  local length = #source
-
-  local function top()
-    return stack[#stack]
-  end
+  local length = failed == nil and #source or 0
 
   local function appendText(chunk: string)
-    local node = top()
+    local node = stack[#stack]
     if node ~= nil and chunk ~= "" then
       node.text = node.text .. chunk
     end
   end
 
-  while pos <= length do
+  -- Consumes the text before the next markup item and the item itself.
+  -- Returns an error message, or nil.
+  local function advance(): string?
     local open = source:find("<", pos, true)
     if open == nil then
       appendText(M.unescape(source:sub(pos)))
-      break
+      pos = length + 1
+      return nil
     end
     if open > pos then
       appendText(M.unescape(source:sub(pos, open - 1)))
@@ -138,37 +147,37 @@ function M.parse(source: string)
     if marker == "?" then
       local finish = source:find("?>", open + 2, true)
       if finish == nil then
-        return nil, "unterminated processing instruction"
+        return "unterminated processing instruction"
       end
       pos = finish + 2
     elseif marker == "!" then
       if source:sub(open + 2, open + 8) == "[CDATA[" then
         local finish = source:find("]]>", open + 9, true)
         if finish == nil then
-          return nil, "unterminated CDATA section"
+          return "unterminated CDATA section"
         end
         appendText(source:sub(open + 9, finish - 1)) -- CDATA is literal, not escaped
         pos = finish + 3
       elseif source:sub(open + 2, open + 3) == "--" then
         local finish = source:find("-->", open + 4, true)
         if finish == nil then
-          return nil, "unterminated comment"
+          return "unterminated comment"
         end
         pos = finish + 3
       else
         local finish = source:find(">", open + 2, true)
         if finish == nil then
-          return nil, "unterminated declaration"
+          return "unterminated declaration"
         end
         pos = finish + 1
       end
     elseif marker == "/" then
       local finish = source:find(">", open + 2, true)
       if finish == nil then
-        return nil, "unterminated closing tag"
+        return "unterminated closing tag"
       end
       if #stack == 0 then
-        return nil, "closing tag without a matching open tag"
+        return "closing tag without a matching open tag"
       end
       -- A mismatch means the document is not what it claims to be; unwinding
       -- to the named element instead would quietly reshape the tree the
@@ -176,7 +185,7 @@ function M.parse(source: string)
       local closing = source:sub(open + 2, finish - 1):match("^([%w_:%-%.]+)")
       local _, closingLocal = splitName(closing or "")
       if closingLocal ~= stack[#stack].name then
-        return nil, "closing </" .. tostring(closing) .. "> does not match <" .. stack[#stack].name .. ">"
+        return "closing </" .. tostring(closing) .. "> does not match <" .. stack[#stack].name .. ">"
       end
       table.remove(stack)
       table.remove(scopes)
@@ -184,7 +193,7 @@ function M.parse(source: string)
     else
       local finish = source:find(">", open + 1, true)
       if finish == nil then
-        return nil, "unterminated tag"
+        return "unterminated tag"
       end
       local body = source:sub(open + 1, finish - 1)
       local selfClosing = body:sub(-1) == "/"
@@ -193,7 +202,7 @@ function M.parse(source: string)
       end
       local qualified = body:match("^([%w_:%-%.]+)")
       if qualified == nil then
-        return nil, "malformed tag"
+        return "malformed tag"
       end
       local attrs = parseAttributes(body:sub(#qualified + 1))
       local scope = scopeFor(scopes[#scopes], attrs)
@@ -205,13 +214,13 @@ function M.parse(source: string)
         children = {},
         text = "",
       }
-      local parent = top()
+      local parent = stack[#stack]
       if parent ~= nil then
         table.insert(parent.children, node)
       elseif root == nil then
         root = node
       else
-        return nil, "multiple root elements"
+        return "multiple root elements"
       end
       if not selfClosing then
         table.insert(stack, node)
@@ -219,15 +228,45 @@ function M.parse(source: string)
       end
       pos = finish + 1
     end
+    return nil
   end
 
-  if #stack > 0 then
-    return nil, "unclosed element <" .. stack[#stack].name .. ">"
+  local function step(shouldYield)
+    if failed ~= nil then
+      return nil, failed
+    end
+    local items = 0
+    while pos <= length do
+      failed = advance()
+      if failed ~= nil then
+        return nil, failed
+      end
+      items += 1
+      if shouldYield ~= nil and items % YIELD_CHECK_ITEMS == 0 and pos <= length and shouldYield() then
+        return false
+      end
+    end
+    if #stack > 0 then
+      failed = "unclosed element <" .. stack[#stack].name .. ">"
+      return nil, failed
+    end
+    if root == nil then
+      failed = "no root element"
+      return nil, failed
+    end
+    return true, root
   end
-  if root == nil then
-    return nil, "no root element"
+
+  return { step = step }
+end
+
+-- Parses a whole document in one call. Returns the root node, or (nil, err).
+function M.parse(source: string)
+  local done, result = M.parser(source).step(nil)
+  if done then
+    return result
   end
-  return root
+  return nil, result
 end
 
 -- Direct children matching a namespace + local name. `ns` of nil matches any.
