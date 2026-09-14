@@ -488,16 +488,25 @@ local PHASE_COLOR = {
 
 local function modelLabel(): string
   local model = tostring(status.model or "")
+  local models = type(caps.models) == "table" and caps.models or {}
   if model == "" then
-    return noctalia.tr("header.model_unset")
+    -- No model on the status until the first session-init frame, but the session
+    -- is already on the CLI's default; name that rather than saying nothing.
+    for _, entry in ipairs(models) do
+      if type(entry) == "table" and tostring(entry.value) == "default" then
+        model = tostring(entry.resolvedModel or "")
+        break
+      end
+    end
+    if model == "" then
+      return noctalia.tr("header.model_default")
+    end
   end
   -- The picker's display names are friendlier than the wire ids.
-  if type(caps.models) == "table" then
-    for _, entry in ipairs(caps.models) do
-      if type(entry) == "table" and entry.resolvedModel == model
-        and tostring(entry.value) ~= "default" then
-        return tostring(entry.displayName or model)
-      end
+  for _, entry in ipairs(models) do
+    if type(entry) == "table" and entry.resolvedModel == model
+      and tostring(entry.value) ~= "default" then
+      return tostring(entry.displayName or model)
     end
   end
   return (model:gsub("^claude%-", ""))

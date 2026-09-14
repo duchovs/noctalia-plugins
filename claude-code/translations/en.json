@@ -15,8 +15,8 @@
   },
   "header": {
     "mode_tooltip": "Permission mode — applied to the live session",
+    "model_default": "Sonnet",
     "model_tooltip": "Model — applied to the live session",
-    "model_unset": "Model",
     "sessions_tooltip": "Earlier sessions in this directory"
   },
   "mode": {
