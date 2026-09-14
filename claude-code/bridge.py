@@ -36,6 +36,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # Only used to label the request; the endpoint keys off the OAuth token.
@@ -396,6 +397,18 @@ def list_sessions(cwd: str) -> list[dict]:
     return rows[:40]
 
 
+def parse_ts(value) -> int:
+    """Claude Code's own records carry an ISO-8601 `timestamp` field. Replayed
+    history previously hardcoded 0 here, which is harmless while the panel
+    doesn't render `ts`, but wrong data is wrong data."""
+    if not isinstance(value, str):
+        return 0
+    try:
+        return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+    except ValueError:
+        return 0
+
+
 def load_history(cwd: str, session_id: str, limit: int = 120) -> list[dict]:
     """Replay a stored session into transcript items.
 
@@ -419,7 +432,7 @@ def load_history(cwd: str, session_id: str, limit: int = 120) -> list[dict]:
         kind = record.get("type")
         message = record.get("message") or {}
         content = message.get("content")
-        stamp = 0
+        stamp = parse_ts(record.get("timestamp"))
 
         if kind == "user":
             if isinstance(content, str):
@@ -428,15 +441,27 @@ def load_history(cwd: str, session_id: str, limit: int = 120) -> list[dict]:
                     items.append({"kind": "user", "text": text, "ts": stamp})
             elif isinstance(content, list):
                 for block in content:
-                    if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    if not isinstance(block, dict):
                         continue
-                    position = pending.get(block.get("tool_use_id") or "")
-                    if position is None:
-                        continue
-                    body = block_text(block)
-                    items[position]["state"] = "error" if block.get("is_error") else "ok"
-                    items[position]["output"] = body[:TOOL_OUTPUT_CLAMP]
-                    items[position]["truncated"] = len(body) > TOOL_OUTPUT_CLAMP
+                    if block.get("type") == "tool_result":
+                        position = pending.get(block.get("tool_use_id") or "")
+                        if position is None:
+                            continue
+                        body = block_text(block)
+                        items[position]["state"] = "error" if block.get("is_error") else "ok"
+                        items[position]["output"] = body[:TOOL_OUTPUT_CLAMP]
+                        items[position]["truncated"] = len(body) > TOOL_OUTPUT_CLAMP
+                    elif block.get("type") == "text":
+                        # Real user turns land here whenever the CLI records them
+                        # as a content list instead of a bare string (routine —
+                        # every session in this user's own history has some).
+                        # The old code only scanned list-form content for
+                        # tool_result blocks, so every one of these was silently
+                        # dropped from resumed history despite being a real,
+                        # visible turn in the live session.
+                        text = (block.get("text") or "").strip()
+                        if text and not text.startswith("<"):
+                            items.append({"kind": "user", "text": text, "ts": stamp})
         elif kind == "assistant" and isinstance(content, list):
             for block in content:
                 if not isinstance(block, dict):
@@ -516,7 +541,15 @@ class Session:
         ]
         session_id = self.options.get("resume")
         if session_id:
-            args += ["--resume", session_id]
+            # --fork-session is load-bearing, not cosmetic: without it this
+            # process shares the session ID with whatever else has it open
+            # (e.g. a terminal or the desktop app), and Claude Code's Remote
+            # Control ownership treats that as a single conversation with one
+            # legitimate driver — the bridge's writes land in a session that
+            # something else already owns, and nothing here renders. Forking
+            # seeds this session from the same history but gives it its own
+            # ID, so it never contends for ownership of the original.
+            args += ["--resume", session_id, "--fork-session"]
         return args
 
     def start(self) -> None:
