@@ -11,13 +11,13 @@
 [[plugin]]
 id = "duchovs/bitdjinn"
 name = "BitDjinn (local fork)"
-version = "1.2.0"
-updated_at = 1788928483
+version = "1.3.0"
+updated_at = 1790363815
 added_at = 1788809688
 author = "duchovs"
 license = "MIT"
 icon = "currency-bitcoin"
-description = "Real-time cryptocurrency ticker, trend charts, and blockchain balance monitoring with transaction alerts."
+description = "Real-time cryptocurrency and stock tickers, trend charts, and blockchain balance monitoring with transaction alerts."
 plugin_api = 19
 tags = ["utility", "indicator", "network", "panel", "bar"]
 
