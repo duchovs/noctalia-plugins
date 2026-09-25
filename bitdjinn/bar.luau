@@ -51,7 +51,7 @@ local function render()
     ui.glyph({
       name = coin.glyph or format.coinGlyph(coin.symbol, coin.kind),
       size = 15,
-      color = "primary",
+      color = changeCol,
     }),
     ui.label({
       text = coin.symbol,
