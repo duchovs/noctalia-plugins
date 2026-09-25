@@ -85,7 +85,7 @@ local function renderMarketTab()
           ui.glyph({
             name = c.glyph or format.coinGlyph(c.symbol, c.kind),
             size = 20,
-            color = changeCol,
+            color = "primary",
           }),
           ui.column({ gap = 1 }, {
             ui.label({ text = c.symbol, fontWeight = "bold", fontSize = 13 }),
