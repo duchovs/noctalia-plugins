@@ -360,7 +360,7 @@ end
 
 -- ── Building blocks ──────────────────────────────────────────────────────────
 
-local function iconButton(key: string, glyph: string, tooltip: string, onClick, variant: string?, onHover)
+local function iconButton(key: string, glyph: string, tooltip: string, onClick, variant: string?)
   return ui.button({
     key = key,
     glyph = glyph,
@@ -368,7 +368,6 @@ local function iconButton(key: string, glyph: string, tooltip: string, onClick, 
     controlSize = "sm",
     tooltip = tooltip,
     onClick = onClick,
-    onHover = onHover,
   })
 end
 
@@ -385,12 +384,9 @@ local function sectionHeader(label: string, count: number)
   })
 end
 
--- The host hovers only the innermost input area under the pointer, so a row's
--- checkbox and buttons forward their hover to the row or it un-highlights there.
-local function rowHover(uid: string)
-  return function(state)
-    onRowHover(state, uid)
-  end
+-- Row children report hover to onRowHover under a "<part>::<row key>" key.
+local function childKey(part: string, uid: string): string
+  return part .. "::" .. uid
 end
 
 -- A checkbox that reads as one: an outlined square in the list's colour that
@@ -399,7 +395,7 @@ local function checkbox(task, color: string, readOnly: boolean?)
   local checked = task.completed
   local pending = busy[task.uid] == true
   return ui.column({
-    key = "check-" .. task.uid .. (checked and "-on" or "-off") .. (readOnly and "-ro" or ""),
+    key = childKey("check" .. (checked and "-on" or "-off") .. (readOnly and "-ro" or ""), task.uid),
     width = 22,
     height = 22,
     minWidth = 22,
@@ -410,7 +406,7 @@ local function checkbox(task, color: string, readOnly: boolean?)
     border = checked and color or "outline",
     borderWidth = checked and 0 or 2,
     opacity = (pending or readOnly) and 0.5 or 1.0,
-    onHover = rowHover(task.uid),
+    onHover = "onRowHover",
     -- A collection the server grants no write privilege on gets no control at
     -- all, rather than one that fails on click.
     onClick = not readOnly and function()
@@ -508,27 +504,30 @@ local function taskRow(task, listInfo, today: number, showListName: boolean)
   end
   if confirming and not readOnly then
     table.insert(trailing, ui.label({ text = tr("confirm_delete"), fontSize = 11, color = "error" }))
-    table.insert(trailing, iconButton("del-yes-" .. task.uid, "check", tr("delete"), function()
+    table.insert(trailing, iconButton(childKey("del-yes", task.uid), "check", tr("delete"), function()
       deleteTask(task)
-    end, "destructive", rowHover(task.uid)))
-    table.insert(trailing, iconButton("del-no-" .. task.uid, "close", tr("cancel"), function()
+    end, "destructive"))
+    table.insert(trailing, iconButton(childKey("del-no", task.uid), "close", tr("cancel"), function()
       pendingDelete = nil
       render()
-    end, nil, rowHover(task.uid)))
+    end))
   else
-    -- Always laid out and only faded in on hover: inserting it reflowed the row.
+    -- Always shown, same as upstream's notes plugin does its row delete
+    -- button: a plain ghost ui.button with no onHover/selected. No official
+    -- plugin ever puts onHover on a button - only on the container rows that
+    -- drive their own custom fill - and every attempt to hover-hide this one
+    -- instead (fading it in/out, or syncing its look to the row's hover
+    -- state) fought that and lost: the button's native hover either got
+    -- reset by the competing onHover subscription, or got overridden into a
+    -- permanently-on look by `selected`, or the button disappearing out from
+    -- under the pointer read as leaving the row entirely.
     local action = readOnly
       and ui.glyph({ name = "lock", size = 13, color = "on_surface_variant" })
-      or iconButton("del-" .. task.uid, "trash", tr("delete"), function()
+      or iconButton(childKey("del", task.uid), "trash", tr("delete"), function()
         pendingDelete = task.uid
         render()
-      end, nil, rowHover(task.uid))
-    table.insert(trailing, ui.row({
-      key = "action-" .. task.uid,
-      align = "center",
-      justify = "center",
-      opacity = hovered and 1.0 or 0.0,
-    }, { action }))
+      end)
+    table.insert(trailing, action)
   end
 
   local children = {
@@ -1183,15 +1182,30 @@ end
 
 -- ── Callbacks ────────────────────────────────────────────────────────────────
 
+local pendingLeave = nil
+
 function onRowHover(state, key)
+  key = key:match("::(.+)$") or key
   if state == "true" then
-    hoveredKey = key
+    pendingLeave = nil
+    if hoveredKey ~= key then
+      hoveredKey = key
+      render()
+    end
   elseif hoveredKey == key then
-    hoveredKey = nil
-  else
-    return -- a leave from an area that no longer owns the hover
+    -- Settled next frame, so a leave followed by a child's enter never draws unhovered.
+    pendingLeave = key
+    panel.setNeedsFrameTick(true)
   end
-  render()
+end
+
+function onFrameTick(_deltaMs)
+  panel.setNeedsFrameTick(false)
+  if pendingLeave ~= nil and hoveredKey == pendingLeave then
+    hoveredKey = nil
+    render()
+  end
+  pendingLeave = nil
 end
 
 function onQuickAdd(value)
