@@ -20,9 +20,11 @@ local summary = {}
 
 -- ── Tab Renderers ──────────────────────────────────────────────────────────
 
-local function openTradingView(symbol: string)
-  local url = "https://www.tradingview.com/symbols/" .. symbol .. "USD/"
-  noctalia.runAsync({ "xdg-open", url })
+-- Crypto lives at /symbols/<SYM>USD/ on TradingView; equities are just /symbols/<SYM>/.
+local function openTradingView(c: any)
+  local symbol = c.symbol or ""
+  local path = if c.kind == "stock" then symbol else symbol .. "USD"
+  noctalia.runAsync({ "xdg-open", "https://www.tradingview.com/symbols/" .. path .. "/" })
 end
 
 -- Thin insertion drop zone between (or after) coin rows, for drag-to-reorder.
@@ -76,12 +78,12 @@ local function renderMarketTab()
         flexGrow = 1,
         gap = 10,
         align = "center",
-        onClick = function() openTradingView(c.symbol) end,
+        onClick = function() openTradingView(c) end,
       }, {
         -- Coin Icon & Name
         ui.row({ gap = 8, align = "center", width = 110 }, {
           ui.glyph({
-            name = c.glyph or format.coinGlyph(c.symbol),
+            name = c.glyph or format.coinGlyph(c.symbol, c.kind),
             size = 20,
             color = "primary",
           }),

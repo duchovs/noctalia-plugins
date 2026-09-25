@@ -33,7 +33,7 @@ local function render()
     -- Header: Coin Symbol, Price & Change Pill
     ui.row({ align = "center", justify = "space_between" }, {
       ui.row({ gap = 6, align = "center" }, {
-        ui.glyph({ name = format.coinGlyph(topCoin.symbol), size = 18, color = "primary" }),
+        ui.glyph({ name = topCoin.glyph or format.coinGlyph(topCoin.symbol, topCoin.kind), size = 18, color = "primary" }),
         ui.label({ text = topCoin.symbol, fontWeight = "bold", fontSize = 14 }),
       }),
       ui.row({

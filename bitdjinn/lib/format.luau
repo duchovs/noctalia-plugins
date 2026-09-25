@@ -124,8 +124,11 @@ function M.detectChain(addr: string?): string
   return "unknown"
 end
 
-function M.coinGlyph(symbol: string?): string
+function M.coinGlyph(symbol: string?, kind: string?): string
   local sym = string.upper(symbol or "")
+  if kind == "stock" then
+    return "chart-candle"
+  end
   if sym == "BTC" then
     return "currency-bitcoin"
   elseif sym == "ETH" then

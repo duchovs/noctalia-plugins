@@ -49,7 +49,7 @@ local function render()
     paddingH = 4,
   }, {
     ui.glyph({
-      name = coin.glyph or format.coinGlyph(coin.symbol),
+      name = coin.glyph or format.coinGlyph(coin.symbol, coin.kind),
       size = 15,
       color = "primary",
     }),
