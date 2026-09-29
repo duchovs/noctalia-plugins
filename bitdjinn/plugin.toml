@@ -4,7 +4,7 @@
 
 id = "duchovs/bitdjinn"
 name = "BitDjinn (local fork)"
-version = "1.3.0"
+version = "1.4.0"
 plugin_api = 19
 author = "duchovs"
 license = "MIT"

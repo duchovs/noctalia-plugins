@@ -19,6 +19,12 @@ local coinDefs = {
 }
 
 local MAX_HISTORY_POINTS = 36
+-- Longest a market poll may stay in flight before the timer is allowed to start another
+-- (two chained 30s HTTP timeouts, plus slack).
+local MARKET_STALL_SECONDS = 90
+-- Ceiling for the CoinGecko backoff. Its keyless tier answers abuse with 429s and, when it
+-- keeps up, a CDN-level 403 block; hammering through either only extends it.
+local COINGECKO_BACKOFF_MAX_SECONDS = 1800
 
 -- Yahoo Finance chart endpoint. Deliberately queried WITHOUT `includePrePost`: the
 -- sparkline, % change, day high/low and volume must all describe the *regular* session
@@ -26,6 +32,12 @@ local MAX_HISTORY_POINTS = 36
 -- is populated regardless of that flag -- so one request serves both needs.
 local STOCK_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/%s?range=1d&interval=5m"
 local STOCK_UA = "Mozilla/5.0 (X11; Linux x86_64)"
+-- Crypto fallback while CoinGecko is out. Hourly bars over 5d cover a rolling 24h window,
+-- so change/high/low/volume keep CoinGecko's "last 24h" meaning instead of Yahoo's
+-- since-UTC-midnight regularMarketChangePercent, and the tail matches the 37 hourly
+-- points the CoinGecko 7d sparkline is sliced to.
+local CRYPTO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/%s?range=5d&interval=1h"
+local CRYPTO_SPARKLINE_POINTS = 37
 
 -- A stock def is tagged kind == "stock"; crypto defs leave `kind` nil.
 local function isStock(def: any): boolean
@@ -83,7 +95,18 @@ local marketData = {}     -- array of coin tables
 local watchedWallets = {} -- array of wallet objects
 local isUpdating = false
 local lastMarketFetchTime = 0
+-- When the last poll was *started*, success or not. The poll timer keys off this, not
+-- lastMarketFetchTime: a failed fetch leaves lastMarketFetchTime stale, and gating on it
+-- re-fired every 1s tick -- a retry storm that kept CoinGecko answering 429.
+local lastMarketAttemptTime = 0
 local lastWalletFetchTime = 0
+-- CoinGecko backoff: consecutive failed polls, and the time before which polls skip it
+-- entirely (crypto rows fall back to cached prices; Yahoo stocks carry on). Persisted, so a
+-- plugin reload or shell restart mid-ban doesn't reset straight into another request.
+local coinGeckoFailures = 0
+local coinGeckoRetryAt = 0
+-- Where crypto quotes came from last poll ("coingecko" or "yahoo"); only a change is logged.
+local cryptoSource = "coingecko"
 
 -- ── Persistence ────────────────────────────────────────────────────────────
 
@@ -108,6 +131,8 @@ local function saveState()
     priceHistory = priceHistory,
     lastChange = lastChange,
     coins = coinDefs,
+    coinGeckoFailures = coinGeckoFailures,
+    coinGeckoRetryAt = coinGeckoRetryAt,
   }
   local raw = noctalia.json.encode(payload)
   if raw ~= nil then
@@ -140,6 +165,12 @@ local function loadState()
         end
         if type(decoded.coins) == "table" and #decoded.coins > 0 then
           coinDefs = decoded.coins
+        end
+        if type(decoded.coinGeckoFailures) == "number" then
+          coinGeckoFailures = decoded.coinGeckoFailures
+        end
+        if type(decoded.coinGeckoRetryAt) == "number" then
+          coinGeckoRetryAt = decoded.coinGeckoRetryAt
         end
         if type(decoded.lastChange) == "table" then
           for coinId, ch in pairs(decoded.lastChange) do
@@ -231,7 +262,8 @@ local function publishState()
   })
 end
 
-local function updateExchangeRates(onDone: () -> ())
+-- Calls onDone(status): the HTTP status, 0 for a transport failure (timeout, TLS drop).
+local function updateExchangeRates(onDone: (number) -> ())
   local rateUrl = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd,cny,eur,eth"
   noctalia.http({
     url = rateUrl,
@@ -260,8 +292,83 @@ local function updateExchangeRates(onDone: () -> ())
         end
       end
     end
-    onDone()
+    onDone(res.status or 0)
   end)
+end
+
+-- One published market row for `def`. `item` is a fresh quote in CoinGecko's market-item
+-- shape (stocks are normalized into it); nil falls back to cached priceHistory/lastChange.
+local function marketEntry(def: any, item: any?, currentRate: number): any
+  local baseUsdPrice = def.defaultPrice
+  local change = 0
+  local vol = 0
+  local high24 = 0
+  local low24 = 0
+  local sparkline = nil
+
+  if item ~= nil then
+    baseUsdPrice = tonumber(item.current_price) or def.defaultPrice
+    change = tonumber(item.price_change_percentage_24h) or 0
+    lastChange[def.id] = change
+    vol = tonumber(item.total_volume) or 0
+    high24 = (tonumber(item.high_24h) or 0) * currentRate
+    low24 = (tonumber(item.low_24h) or 0) * currentRate
+
+    if type(item.sparkline_in_7d) == "table" and type(item.sparkline_in_7d.price) == "table" then
+      local rawPoints = item.sparkline_in_7d.price
+      local totalRaw = #rawPoints
+      if totalRaw >= 24 then
+        local sliced = {}
+        local startIdx = math.max(1, totalRaw - 36)
+        for i = startIdx, totalRaw do
+          table.insert(sliced, rawPoints[i])
+        end
+        sparkline = sliced
+        priceHistory[def.id] = sliced
+      end
+    end
+  else
+    -- No fresh data for this coin (API failure, or just added): fall back to the last
+    -- known price and 24h move. Checked outside the priceHistory guard so the change
+    -- is restored even for a ticker that has no cached series yet.
+    change = lastChange[def.id] or 0
+    if priceHistory[def.id] ~= nil and #priceHistory[def.id] > 0 then
+      baseUsdPrice = priceHistory[def.id][#priceHistory[def.id]]
+    end
+  end
+
+  if sparkline == nil then
+    local hist = priceHistory[def.id]
+    if hist == nil then
+      hist = {}
+      priceHistory[def.id] = hist
+    end
+    -- Only a fresh quote extends the series. Re-appending the cached price on every failed
+    -- poll flattened the whole graph within MAX_HISTORY_POINTS polls of an outage.
+    if item ~= nil or #hist == 0 then
+      table.insert(hist, baseUsdPrice)
+      if #hist > MAX_HISTORY_POINTS then
+        table.remove(hist, 1)
+      end
+    end
+    sparkline = hist
+  end
+
+  return {
+    id = def.id,
+    symbol = def.symbol,
+    name = def.name,
+    glyph = def.glyph,
+    kind = def.kind,
+    ticker = def.ticker,
+    baseUsdPrice = baseUsdPrice,
+    price = baseUsdPrice * currentRate,
+    change24h = change,
+    vol24h = vol * currentRate,
+    high24h = high24,
+    low24h = low24,
+    graphValues = format.normalizeForGraph(sparkline),
+  }
 end
 
 -- Rebuild the published market array from the current coin list. `coinMap` (id -> CoinGecko
@@ -271,75 +378,10 @@ end
 local function buildMarketData(coinMap: { [string]: any }?): { any }
   local currentRate = getRate(currentCurrency)
   local updatedMarket = {}
-
   for _, def in ipairs(coinDefs) do
     local item = if coinMap ~= nil then coinMap[def.id] else nil
-    local baseUsdPrice = def.defaultPrice
-    local change = 0
-    local vol = 0
-    local high24 = 0
-    local low24 = 0
-    local sparkline = nil
-
-    if item ~= nil then
-      baseUsdPrice = tonumber(item.current_price) or def.defaultPrice
-      change = tonumber(item.price_change_percentage_24h) or 0
-      lastChange[def.id] = change
-      vol = tonumber(item.total_volume) or 0
-      high24 = (tonumber(item.high_24h) or 0) * currentRate
-      low24 = (tonumber(item.low_24h) or 0) * currentRate
-
-      if type(item.sparkline_in_7d) == "table" and type(item.sparkline_in_7d.price) == "table" then
-        local rawPoints = item.sparkline_in_7d.price
-        local totalRaw = #rawPoints
-        if totalRaw >= 24 then
-          local sliced = {}
-          local startIdx = math.max(1, totalRaw - 36)
-          for i = startIdx, totalRaw do
-            table.insert(sliced, rawPoints[i])
-          end
-          sparkline = sliced
-          priceHistory[def.id] = sliced
-        end
-      end
-    else
-      -- No fresh data for this coin (API failure, or just added): fall back to the last
-      -- known price and 24h move. Checked outside the priceHistory guard so the change
-      -- is restored even for a ticker that has no cached series yet.
-      change = lastChange[def.id] or 0
-      if priceHistory[def.id] ~= nil and #priceHistory[def.id] > 0 then
-        baseUsdPrice = priceHistory[def.id][#priceHistory[def.id]]
-      end
-    end
-
-    if sparkline == nil then
-      if priceHistory[def.id] == nil then
-        priceHistory[def.id] = {}
-      end
-      table.insert(priceHistory[def.id], baseUsdPrice)
-      if #priceHistory[def.id] > MAX_HISTORY_POINTS then
-        table.remove(priceHistory[def.id], 1)
-      end
-      sparkline = priceHistory[def.id]
-    end
-
-    table.insert(updatedMarket, {
-      id = def.id,
-      symbol = def.symbol,
-      name = def.name,
-      glyph = def.glyph,
-      kind = def.kind,
-      ticker = def.ticker,
-      baseUsdPrice = baseUsdPrice,
-      price = baseUsdPrice * currentRate,
-      change24h = change,
-      vol24h = vol * currentRate,
-      high24h = high24,
-      low24h = low24,
-      graphValues = format.normalizeForGraph(sparkline),
-    })
+    table.insert(updatedMarket, marketEntry(def, item, currentRate))
   end
-
   return updatedMarket
 end
 
@@ -420,93 +462,259 @@ local function fetchStockQuote(def: any, coinMap: { [string]: any }, onDone: (bo
   end)
 end
 
-local function fetchMarketPrices()
-  isUpdating = true
-  publishState()
+-- Yahoo lists most coins as <SYM>-USD. A def can carry `yahoo` to override that for the
+-- few that collide with another listing (Yahoo suffixes those with a numeric id).
+local function yahooCryptoSymbol(def: any): string
+  return def.yahoo or (string.upper(def.symbol or "") .. "-USD")
+end
 
-  -- Fetch fresh exchange rates and market data in parallel
-  updateExchangeRates(function()
-    local cryptoIds = {}
-    local stockDefs = {}
-    for _, def in ipairs(coinDefs) do
-      if isStock(def) then
-        table.insert(stockDefs, def)
-      else
-        table.insert(cryptoIds, def.id)
-      end
+-- Fetch one coin from Yahoo and normalize it into CoinGecko's market-item shape, as
+-- fetchStockQuote does for equities.
+local function fetchYahooCryptoQuote(def: any, coinMap: { [string]: any }, onDone: (boolean) -> ())
+  local sym = yahooCryptoSymbol(def)
+  noctalia.http({
+    url = string.format(CRYPTO_CHART_URL, urlEncode(sym)),
+    method = "GET",
+    headers = { "Accept: application/json", "User-Agent: " .. STOCK_UA },
+  }, function(res)
+    if not res.ok or res.status ~= 200 then
+      noctalia.log(string.format("BitDjinn: Yahoo crypto fetch error %s status %d", sym, res.status))
+      onDone(false)
+      return
     end
 
-    -- Both sources write into one map, which is handed to buildMarketData once every
-    -- request has reported in. Any id missing from it falls back to cached history, so a
-    -- failure on one source never blanks out the other's tickers.
-    local coinMap = {}
-    local anyOk = false
-    -- +1 pre-count so an early synchronous failure can't fire finish() before every
-    -- request has been dispatched.
-    local pending = 1
-
-    local function finish()
-      pending = pending - 1
-      if pending > 0 then
-        return
-      end
-      isUpdating = false
-      marketData = buildMarketData(coinMap)
-      if anyOk then
-        lastMarketFetchTime = os.time()
-      end
-      saveState()
-      publishState()
+    local data = noctalia.json.decode(res.body)
+    local result = nil
+    if type(data) == "table" and type(data.chart) == "table" and type(data.chart.result) == "table" then
+      result = data.chart.result[1]
+    end
+    if type(result) ~= "table" or type(result.meta) ~= "table" then
+      onDone(false)
+      return
+    end
+    local meta = result.meta
+    local price = tonumber(meta.regularMarketPrice)
+    if price == nil or price <= 0 then
+      onDone(false)
+      return
     end
 
-    if #cryptoIds > 0 then
-      pending = pending + 1
-      local url = string.format(
-        "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=%s&sparkline=true&price_change_percentage=24h",
-        table.concat(cryptoIds, ",")
-      )
-      noctalia.http({
-        url = url,
-        method = "GET",
-        headers = { "Accept: application/json", "User-Agent: Mozilla/5.0 (Noctalia-BitDjinn)" },
-      }, function(res)
-        if not res.ok or res.status ~= 200 then
-          noctalia.log(string.format("BitDjinn: market fetch error status %d, using cached prices", res.status))
-          finish()
-          return
-        end
-
-        local data, err = noctalia.json.decode(res.body)
-        if err ~= nil or type(data) ~= "table" then
-          noctalia.log("BitDjinn: json decode error for market data")
-          finish()
-          return
-        end
-
-        for _, item in ipairs(data) do
-          if type(item) == "table" and item.id ~= nil then
-            coinMap[item.id] = item
-            anyOk = true
+    -- Walk the hourly bars once: the last close that ended 24h+ ago is the change base;
+    -- bars after it make up the rolling 24h high/low/volume. As in fetchStockQuote,
+    -- `timestamp` bounds the walk because `close` can carry null holes.
+    local timestamps = if type(result.timestamp) == "table" then result.timestamp else {}
+    local quote = if type(result.indicators) == "table" and type(result.indicators.quote) == "table"
+      then result.indicators.quote[1]
+      else nil
+    local closes = {}
+    local base, high24, low24, vol24 = nil, price, price, 0
+    if type(quote) == "table" and type(quote.close) == "table" then
+      local cutoff = (tonumber(meta.regularMarketTime) or os.time()) - 86400
+      for i = 1, #timestamps do
+        local close = tonumber(quote.close[i])
+        if close ~= nil and close > 0 then
+          table.insert(closes, close)
+          -- A bar is stamped with its open; it closes an hour later.
+          if timestamps[i] + 3600 <= cutoff then
+            base = close
+          else
+            local hi = if type(quote.high) == "table" then tonumber(quote.high[i]) else nil
+            local lo = if type(quote.low) == "table" then tonumber(quote.low[i]) else nil
+            if hi ~= nil and hi > high24 then high24 = hi end
+            if lo ~= nil and lo > 0 and lo < low24 then low24 = lo end
+            vol24 = vol24 + (if type(quote.volume) == "table" then tonumber(quote.volume[i]) or 0 else 0)
           end
         end
-        finish()
-      end)
+      end
     end
 
-    -- Yahoo has no batch endpoint, so this is one request per stock per poll. Keep the
-    -- `interval` setting reasonably high if you watch a lot of tickers.
-    for _, def in ipairs(stockDefs) do
+    local change = if base ~= nil then (price / base - 1) * 100 else tonumber(meta.regularMarketChangePercent) or 0
+    local sparkline = nil
+    if #closes >= 24 then
+      sparkline = {}
+      for i = math.max(1, #closes - CRYPTO_SPARKLINE_POINTS + 1), #closes do
+        table.insert(sparkline, closes[i])
+      end
+    end
+
+    coinMap[def.id] = {
+      current_price = price,
+      price_change_percentage_24h = change,
+      total_volume = vol24,
+      high_24h = high24,
+      low_24h = low24,
+      sparkline_in_7d = if sparkline ~= nil then { price = sparkline } else nil,
+    }
+    -- The BTC/ETH display currencies are just these prices inverted, so they stay live
+    -- through a CoinGecko outage too (CNY/EUR keep their cached rates).
+    if def.id == "bitcoin" then
+      exchangeRates.btc = 1.0 / price
+    elseif def.id == "ethereum" then
+      exchangeRates.eth = 1.0 / price
+    end
+    onDone(true)
+  end)
+end
+
+local function fetchMarketPrices()
+  isUpdating = true
+  lastMarketAttemptTime = os.time()
+  publishState()
+
+  local cryptoIds = {}
+  local cryptoDefs = {}
+  local stockDefs = {}
+  for _, def in ipairs(coinDefs) do
+    if isStock(def) then
+      table.insert(stockDefs, def)
+    else
+      table.insert(cryptoIds, def.id)
+      table.insert(cryptoDefs, def)
+    end
+  end
+
+  -- Every source writes into one map, which is handed to buildMarketData once every
+  -- request has reported in. Any id missing from it falls back to cached history, so a
+  -- failure on one source never blanks out the other's tickers.
+  local coinMap = {}
+  local anyOk = false
+  -- +1 pre-count so an early synchronous failure can't fire finish() before every
+  -- request has been dispatched.
+  local pending = 1
+
+  -- CoinGecko is skipped outright while backing off; otherwise every one of its requests
+  -- reports in here, and the first failure (status 0 = transport error) decides the poll.
+  local useCoinGecko = os.time() >= coinGeckoRetryAt
+  local coinGeckoFailStatus: number? = nil
+  local function noteCoinGecko(status: number, ok: boolean)
+    if not ok and coinGeckoFailStatus == nil then
+      coinGeckoFailStatus = status
+    end
+  end
+
+  local function settleCoinGecko()
+    if not useCoinGecko then
+      return
+    end
+    if coinGeckoFailStatus ~= nil then
+      coinGeckoFailures = coinGeckoFailures + 1
+      -- interval * 2^n: 60s, 2m, 4m, 8m, 16m, then the 30m ceiling at the default interval.
+      local delay = math.min(marketPollInterval * 2 ^ coinGeckoFailures, COINGECKO_BACKOFF_MAX_SECONDS)
+      coinGeckoRetryAt = os.time() + delay
+      noctalia.log(string.format(
+        "BitDjinn: CoinGecko unavailable (status %d, failure %d); retrying in %ds",
+        coinGeckoFailStatus, coinGeckoFailures, delay
+      ))
+    elseif coinGeckoFailures > 0 then
+      noctalia.log(string.format("BitDjinn: CoinGecko reachable again after %d failed polls", coinGeckoFailures))
+      coinGeckoFailures = 0
+      coinGeckoRetryAt = 0
+    end
+  end
+
+  local function finish()
+    pending = pending - 1
+    if pending > 0 then
+      return
+    end
+    isUpdating = false
+    settleCoinGecko()
+    marketData = buildMarketData(coinMap)
+    if anyOk then
+      lastMarketFetchTime = os.time()
+    end
+    saveState()
+    publishState()
+  end
+
+  -- While CoinGecko is out, crypto comes from Yahoo instead (one request per coin). Called
+  -- from inside a pending CoinGecko callback, so finish() can't settle before these land.
+  local function fetchCryptoFromYahoo()
+    if cryptoSource ~= "yahoo" then
+      noctalia.log("BitDjinn: crypto quotes falling back to Yahoo")
+      cryptoSource = "yahoo"
+    end
+    for _, def in ipairs(cryptoDefs) do
       pending = pending + 1
-      fetchStockQuote(def, coinMap, function(ok)
+      fetchYahooCryptoQuote(def, coinMap, function(ok)
         if ok then
           anyOk = true
         end
         finish()
       end)
     end
+  end
 
-    finish()
-  end)
+  if not useCoinGecko then
+    fetchCryptoFromYahoo()
+  end
+
+  if useCoinGecko then
+    -- Exchange rates run alongside the quotes rather than gating them: stock prices come
+    -- from Yahoo in USD, and a slow or rate-limited CoinGecko must not hold them hostage.
+    pending = pending + 1
+    updateExchangeRates(function(status)
+      noteCoinGecko(status, status == 200)
+      finish()
+    end)
+  end
+
+  if useCoinGecko and #cryptoIds > 0 then
+    pending = pending + 1
+    local url = string.format(
+      "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=%s&sparkline=true&price_change_percentage=24h",
+      table.concat(cryptoIds, ",")
+    )
+    noctalia.http({
+      url = url,
+      method = "GET",
+      headers = { "Accept: application/json", "User-Agent: Mozilla/5.0 (Noctalia-BitDjinn)" },
+    }, function(res)
+      local status = res.status or 0
+      if not res.ok or status ~= 200 then
+        noteCoinGecko(status, false)
+        fetchCryptoFromYahoo()
+        finish()
+        return
+      end
+
+      local data, err = noctalia.json.decode(res.body)
+      if err ~= nil or type(data) ~= "table" then
+        noctalia.log("BitDjinn: json decode error for market data")
+        noteCoinGecko(status, false)
+        fetchCryptoFromYahoo()
+        finish()
+        return
+      end
+
+      noteCoinGecko(status, true)
+      if cryptoSource ~= "coingecko" then
+        noctalia.log("BitDjinn: crypto quotes back on CoinGecko")
+        cryptoSource = "coingecko"
+      end
+      for _, item in ipairs(data) do
+        if type(item) == "table" and item.id ~= nil then
+          coinMap[item.id] = item
+          anyOk = true
+        end
+      end
+      finish()
+    end)
+  end
+
+  -- Yahoo has no batch endpoint, so this is one request per stock per poll. Keep the
+  -- `interval` setting reasonably high if you watch a lot of tickers.
+  for _, def in ipairs(stockDefs) do
+    pending = pending + 1
+    fetchStockQuote(def, coinMap, function(ok)
+      if ok then
+        anyOk = true
+      end
+      finish()
+    end)
+  end
+
+  finish()
 end
 
 
@@ -875,6 +1083,18 @@ local function reorderCoins(order: { string }): boolean
   return true
 end
 
+-- Adds a resolved ticker to the watchlist and publishes its row straight away, seeded
+-- from defaultPrice. The live quote follows with fetchMarketPrices; waiting on that alone
+-- left a new ticker invisible for as long as the slowest source took to answer.
+local function appendTicker(def: any)
+  table.insert(coinDefs, def)
+  priceHistory[def.id] = { def.defaultPrice, def.defaultPrice }
+  table.insert(marketData, marketEntry(def, nil, getRate(currentCurrency)))
+  saveState()
+  publishState()
+  fetchMarketPrices()
+end
+
 -- Resolve a bare ticker against Yahoo and append it as a stock def. Validation is just
 -- the quote request itself: if meta comes back with a price, the symbol is real.
 local function addStock(symbol: string, onDone: (boolean, string?) -> ())
@@ -916,7 +1136,7 @@ local function addStock(symbol: string, onDone: (boolean, string?) -> ())
     local resolvedSymbol = string.upper(meta.symbol or sym)
     local price = tonumber(meta.fulldayPrice) or tonumber(meta.regularMarketPrice) or 1
 
-    table.insert(coinDefs, {
+    appendTicker({
       id = id,
       symbol = resolvedSymbol,
       name = meta.shortName or meta.longName or resolvedSymbol,
@@ -925,10 +1145,6 @@ local function addStock(symbol: string, onDone: (boolean, string?) -> ())
       ticker = resolvedSymbol,
       defaultPrice = price,
     })
-    priceHistory[id] = { price, price }
-
-    saveState()
-    fetchMarketPrices()
     onDone(true, resolvedSymbol)
   end)
 end
@@ -975,7 +1191,7 @@ local function addCrypto(query: string, allowStockFallback: boolean, onDone: (bo
       return
     end
 
-    table.insert(coinDefs, {
+    appendTicker({
       id = resolvedId,
       symbol = resolvedSymbol,
       name = top.name or resolvedSymbol,
@@ -983,10 +1199,6 @@ local function addCrypto(query: string, allowStockFallback: boolean, onDone: (bo
       kind = "crypto",
       defaultPrice = 1,
     })
-    priceHistory[resolvedId] = { 1, 1 }
-
-    saveState()
-    fetchMarketPrices()
     onDone(true, resolvedSymbol)
   end)
 end
@@ -1026,6 +1238,7 @@ noctalia.state.watch("bitdjinn.cmd", function(cmd)
   elseif op == "remove_wallet" then
     removeWallet(cmd.address or cmd.id)
   elseif op == "add_coin" then
+    noctalia.log("BitDjinn: add_coin '" .. tostring(cmd.query) .. "'")
     addCoin(cmd.query, function(ok, reasonOrSymbol)
       if ok then
         noctalia.notify(noctalia.tr("title"), string.format(noctalia.tr("market.add_success"), reasonOrSymbol))
@@ -1110,6 +1323,19 @@ function onIpc(event, payload)
     saveState()
     publishState()
     noctalia.notify(noctalia.tr("title"), if notifyEnabled then noctalia.tr("shortcut.label_on") else noctalia.tr("shortcut.label_off"))
+  elseif event == "add_coin" then
+    -- `noctalia msg plugin duchovs/bitdjinn:service all add_coin '$AAPL'`
+    addCoin(payload or "", function(ok, reasonOrSymbol)
+      if ok then
+        noctalia.notify(noctalia.tr("title"), string.format(noctalia.tr("market.add_success"), reasonOrSymbol))
+      else
+        noctalia.notify(noctalia.tr("title"), noctalia.tr("market." .. (reasonOrSymbol or "not_found")))
+      end
+    end)
+  elseif event == "remove_coin" then
+    if removeCoin(payload or "") then
+      noctalia.notify(noctalia.tr("title"), string.format(noctalia.tr("market.remove_success"), payload))
+    end
   end
 end
 
@@ -1118,7 +1344,11 @@ end
 function update()
   tickCount = tickCount + 1
 
-  if tickCount % marketPollInterval == 0 or os.time() - lastMarketFetchTime > marketPollInterval then
+  -- Gate on the last *attempt*: a failed poll must wait out the interval like a good one,
+  -- and a poll still in flight (requests can hang for their full 30s timeout) is never
+  -- stacked on. MARKET_STALL_SECONDS frees the gate if a callback somehow never lands.
+  local sinceAttempt = os.time() - lastMarketAttemptTime
+  if sinceAttempt >= marketPollInterval and (not isUpdating or sinceAttempt >= MARKET_STALL_SECONDS) then
     fetchMarketPrices()
   end
 
@@ -1130,6 +1360,6 @@ end
 -- ── Boot Initialization ────────────────────────────────────────────────────
 
 loadState()
+-- onConfigChanged already kicks off the first market and wallet fetch; calling them again
+-- here fired two concurrent polls on every load.
 onConfigChanged()
-fetchMarketPrices()
-fetchWalletBalances()

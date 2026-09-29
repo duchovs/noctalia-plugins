@@ -485,8 +485,11 @@ function onRefresh()
   noctalia.state.set("bitdjinn.cmd", { op = "refresh" })
 end
 
-function onAddCoin()
-  local q = noctalia.string.trim(addCoinInput)
+-- Enter passes the field's text straight in; the + button passes nothing, so fall back to
+-- the copy onChange has been keeping.
+function onAddCoin(submitted: string?)
+  local raw = if type(submitted) == "string" and submitted ~= "" then submitted else addCoinInput
+  local q = noctalia.string.trim(raw or "")
   if q ~= "" then
     noctalia.state.set("bitdjinn.cmd", { op = "add_coin", query = q })
     addCoinInput = ""

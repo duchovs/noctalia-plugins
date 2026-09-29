@@ -14,7 +14,7 @@ BitDjinn is a real-time cryptocurrency and stock market tracker, trend visualize
 Access the BitDjinn interactive dashboard by clicking the bar widget or via IPC:
 
 ```sh
-noctalia msg panel-toggle nirvam/bitdjinn:panel
+noctalia msg panel-toggle duchovs/bitdjinn:panel
 ```
 
 - **Bar Widget (`bar`)**: Shows current price for your preferred coin (e.g. BTC) and a 24h change pill. Scroll vertically over the widget to cycle through watched assets. Click to open the dashboard panel.
@@ -64,6 +64,22 @@ Caveats:
 - **Non-US listings report in their local currency** and will be mislabeled by the currency
   selector, which assumes USD.
 
+## When CoinGecko is unavailable
+
+CoinGecko's keyless API answers heavy use with `429`s and, if it continues, a CDN-level `403`
+block on its price endpoints. BitDjinn backs off instead of retrying through it: after each
+failed poll CoinGecko is skipped for `interval × 2ⁿ` (60 s, 2 m, 4 m … capped at 30 min),
+and the first success resets that. The backoff survives plugin reloads and shell restarts.
+
+While CoinGecko is skipped or failing, crypto quotes come from Yahoo's `<SYM>-USD` listings
+instead, one request per coin. Hourly bars keep the same meaning as CoinGecko's
+numbers: the change, high/low and volume cover a rolling 24 h window, and the sparkline is
+the last 37 hours. The BTC and ETH display currencies keep updating from those quotes;
+CNY and EUR keep their last cached rate until CoinGecko is back.
+
+`noctalia.log` records each switch between sources (`crypto quotes falling back to Yahoo` /
+`back on CoinGecko`) and each backoff step.
+
 ## Settings
 
 Configure BitDjinn under **Settings → Plugins → BitDjinn** or in `~/.config/noctalia/config.toml`:
@@ -82,23 +98,29 @@ Send commands to BitDjinn's background service from scripts or compositor bindin
 
 ```sh
 # Trigger immediate market prices and on-chain balance refresh
-noctalia msg plugin nirvam/bitdjinn:service all refresh
+noctalia msg plugin duchovs/bitdjinn:service all refresh
 
 # Add a wallet address to watch list (supports BTC, ETH 0x..., and SOL)
-noctalia msg plugin nirvam/bitdjinn:service all add "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045 Vitalik-Cold"
+noctalia msg plugin duchovs/bitdjinn:service all add "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045 Vitalik-Cold"
 
 # Remove a watched address from list
-noctalia msg plugin nirvam/bitdjinn:service all remove "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+noctalia msg plugin duchovs/bitdjinn:service all remove "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+
+# Add a ticker, with the same syntax as the panel's input ($AAPL, coin:eth, AAPL)
+noctalia msg plugin duchovs/bitdjinn:service all add_coin '$AAPL'
+
+# Remove a ticker by id or symbol (stocks' ids are stock:<symbol>)
+noctalia msg plugin duchovs/bitdjinn:service all remove_coin stock:aapl
 
 # Toggle transaction notification alerts
-noctalia msg plugin nirvam/bitdjinn:service all toggle_notify
+noctalia msg plugin duchovs/bitdjinn:service all toggle_notify
 
 # Refresh status bar widget instance on focused output
-noctalia msg plugin nirvam/bitdjinn:bar focused refresh
+noctalia msg plugin duchovs/bitdjinn:bar focused refresh
 ```
 
 ## Notes
 
-- **Network Access**: BitDjinn queries public CoinGecko market endpoints for live exchange rates and sparkline trend history, Yahoo Finance chart endpoints for stock quotes, Mempool.space for Bitcoin addresses, and public JSON-RPC nodes for Ethereum and Solana balances.
+- **Network Access**: BitDjinn queries public CoinGecko market endpoints for live exchange rates and sparkline trend history, Yahoo Finance chart endpoints for stock quotes (and crypto quotes while CoinGecko is unavailable), Mempool.space for Bitcoin addresses, and public JSON-RPC nodes for Ethereum and Solana balances.
 - **Privacy & Security**: All address lookups and API requests are read-only. No private keys, seed phrases, or credentials are ever required or stored.
 - **Local Persistence**: User watchlists, transaction notification states, and cached exchange rate matrices are saved in `$XDG_DATA_HOME/noctalia/bitdjinn_state.json`.
